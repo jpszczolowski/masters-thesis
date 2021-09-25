@@ -1,0 +1,1196 @@
+\documentclass[shortabstract, manyadvisors, english, mgr]{iithesis}
+\usepackage[utf8]{inputenc}
+
+\englishtitle{Integrating the Kernel Address Sanitizer \fmlinebreak into the Mimiker Operating System}
+\polishtitle{Integracja mechanizmu Kernel Address Sanitizer \fmlinebreak z systemem operacyjnym Mimiker}
+\englishabstract{Memory bugs are a source of an evergoing concern for the safety and correctness of programming languages like C and C++. The problem gets worse as the programs get bigger and more complex -- operating system (OS) kernels, on which the thesis concentrates, are a perfect example of that as the Linux kernel has grown to nearly 30 million lines of code in 2020 \cite{bib:linux-loc}. Here I provide an overview of memory bugs and explain why they are so dangerous in terms of application security. Then I discuss generic ways of finding memory bugs as well as state-of-the-art tools available in various OS kernels. Lastly, the focus is put on the Kernel Address Sanitizer (KASan), a tool for finding buffer overflows and uses of freed memory in the kernel-space, which has been recently integrated into many popular OSes including Linux, macOS and NetBSD. I describe the KASan thoroughly, but most importantly, I present how I've added it to the Mimiker (an open-source OS developed at the University of Wrocław) and show what are the benefits of my work.}
+\polishabstract{Błędy zarządzania pamięcią są nieustannym źródłem problemów dla programistów języków C~i~C++. Zagrażają one nie tylko poprawności, ale i bezpieczeństwu wielu aplikacji. Sytuacja jest tym poważniejsza, im więcej kodu ma dane oprogramowanie. Szczególnie odczuwalne jest to w jądrach systemów operacyjnych (SO)~-- dla przykładu, w 2020 roku jądro systemu Linux zawiera już prawie 30 milionów linii kodu~\cite{bib:linux-loc}. Poniższa praca skupia się na błędach zarządzania pamięcią, szczególnie w kontekście jąder SO. Przedstawione są rodzaje takich błędów, powody dla których są one niebezpieczne, jak i ogólne techniki ich wykrywania. Następnie opisane są konkretne narzędzia służące do namierzania tego typu podatności, które obecnie można znaleźć w najpopularniejszych SO. Szczególny nacisk położony został na jedno z~takich narzędzi o nazwie Kernel Address Sanitizer (KASan), wykrywające przepełnienia bufora i~użycia zwolnionej pamięci w przestrzeni jądra, które w ostatnich latach pojawiło się w wielu systemach takich jak Linux, macOS czy NetBSD. W~ramach poniższej pracy KASan został dodany do jądra systemu operacyjnego Mimiker (system rozwijany w Instytucie Informatyki Uniwersytetu Wrocławskiego), co również zostało dokładnie opisane. Na koniec przedstawiona jest lista podatności, które dzięki narzędziu KASan udało się znaleźć i~wyeliminować z jądra Mimiker.}
+\author{Julian Pszczołowski}
+\advisor{Krystian Bacławski \fmlinebreak Piotr Witkowski}
+
+% \date{} % Data zlozenia pracy
+
+\usepackage{amsthm, listings, epigraph, xcolor, xurl, graphicx}
+
+%%% Definicje wzięte z pracy licencjackiej
+\theoremstyle{definition} \newtheorem*{definition}{Definicja}
+\theoremstyle{definition} \newtheorem*{example}{Przykład}
+\theoremstyle{definition} \newtheorem*{remark}{Uwaga}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    numberstyle=\footnotesize,
+    numbers=left,
+    frame=single,
+    extendedchars=true,
+    literate={ą}{{\k{a}}}1 {Ą}{{\k{A}}}1 {ę}{{\k{e}}}1 {Ę}{{\k{E}}}1 {ó}{{\'o}}1 {Ó}{{\'O}}1 {ś}{{\'s}}1 {Ś}{{\'S}}1
+             {ł}{{\l{}}}1 {Ł}{{\L{}}}1 {ż}{{\.z}}1 {Ż}{{\.Z}}1 {ź}{{\'z}}1 {Ź}{{\'Z}}1 {ć}{{\'c}}1 {Ć}{{\'C}}1
+             {ń}{{\'n}}1 {Ń}{{\'N}}1
+}
+
+%%% Kolory do lstlistings 
+\definecolor{codegreen}{rgb}{0.1,0.35,0.2}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+\definecolor{mynavy}{rgb}{0,0,0.4}
+\lstdefinestyle{mylststyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{purple},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{mynavy},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,
+    prebreak=\raisebox{0ex}[0ex][0ex]{\ensuremath{\hookleftarrow}},
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+\lstset{style=mylststyle}
+
+\begin{document}
+
+\chapter{Introduction}
+\label{chapter:1}
+
+Neither an operating system (OS) nor its applications can be secure and reliable if they're based on a buggy OS kernel. The kernel, which is the main part of a system, has an unlimited control over all resources. It provides an abstraction layer that user programs need to launch, run, communicate, access memory, or perform input/output operations. It's also the only component in a system that executes in privileged processor mode. Therefore, the kernel's safety is crucial to the entire system's safety.
+
+Many modern OS kernels are written in languages known for their vulnerability to memory management errors, with C programming language being the most notable example. Moreover, memory bugs are responsible for about 70\% of software security issues, as reported by the Microsoft Security Response Center \cite{bib:msrc-memory-issues}. Numerous techniques have been developed in order to locate such bugs. One of them is the Kernel Address Sanitizer (KASan), a tool that can be integrated into OS kernel, which detects buffer overflows and uses of freed memory at run-time. The tool has been initially added to Linux in 2015~\cite{bib:linux-kasan} and since then to some other well-known OSes, including NetBSD in 2020~\cite{bib:netbsd-9-notes}. There are systems, like FreeBSD, in which the integration of the tool is still a work in progress \cite{bib:freebsd-kasan}. In this paper I show how I've added the KASan into the Mimiker kernel\footnote{Mimiker \cite{bib:mimiker} is an open-source operating system developed at the University of Wrocław since 2015 for educational and research purposes. It is Unix-like and inspired mainly by the *BSD world. Currently it supports only MIPS32 architecture.}. It is worth noting that the tool is architecture-dependent, and none of the aforementioned OSes implements the KASan for MIPS processors, as Mimiker does.
+
+The rest of this paper is structured as follows: in chapter \ref{chapter:2}, I discuss memory bugs in general, show why they're a serious threat to any application's security, and how one can find them. In chapter \ref{chapter:3}, I show what are the state-of-the-art tools for detecting memory errors in modern OS kernels including the Linux kernel. Then, in chapter \ref{chapter:4}, I describe precisely how the KASan works. Finally, in chapter \ref{chapter:5}, I present my contribution which is adding the KASan into the Mimiker, including example error report, implementation details, and a list of already found bugs.
+
+Even though many terms and concepts are explained within the thesis, some basic knowledge of operating systems and computer architecture is required. If needed, please refer to \cite{bib:csapp} and \cite{bib:stallings}.
+
+\chapter{Memory bugs}
+\label{chapter:2}
+In this chapter you will find an overview of memory bugs in lower-level languages like C and C++, but much information also applies to other programming languages.
+
+\section{Types of memory bugs}
+There are many different kinds of bugs related to accessing memory. They can be caused just by dereferencing a wrong address but also by inappropriate use of some memory allocation library (e.g. \texttt{malloc} library), or even wrong understanding of the language's semantics (e.g. whether or not an uninitialized local variable is zeroed).
+
+\begin{description}
+    \item[Overflow and over-read] Overflows (over-reads) happen when a program writes (reads) to (from) a location after the targeted buffer. They can be divided into subcategories depending on the buffer type, for instance: local, global or heap overflow (over-read).
+    \item[Use-after-free] This category contains bugs that occur when a program uses deallocated memory. There are other two closely related types which can be thought of as subcategories: use-after-return and use-after-scope. The main difference is how the memory was deallocated: by freeing a heap object, by returning from a function, or by exiting some local scope.
+    \item[Invalid free] If deallocation is done improperly, so not according to freeing function's documentation, it's considered invalid. Examples include double freeing an object or freeing wrong object (i.e. an address that does not come from an allocation request).
+    \item[Use of uninitialized memory] Uninitialized memory in C and C++ contains a value which is not predictable -- for instance, a result of some previous computation. Therefore, computer programs shouldn't use it.
+    \item[Memory leak] A leak occurs when there is a buffer that a computer program no longer uses, but the buffer is not being deallocated. It reduces the amount of available memory which in some cases may cause application failure or trashing.
+    \item[Invalid page fault] Page faults can happen while accessing memory and that doesn't always indicate an error -- for instance, Linux's copy-on-write technique uses page faults to detect first write to a shared memory page, which means that the kernel needs to create a local copy of that page (\cite{bib:linux-kernel-arch}, section 2.4.1). However, a bug occurs when the kernel's page fault handler finds out that the memory access is truly illegal.
+    \item[Race condition] When two threads use some shared memory location but are not synchronized properly, a race condition happens and the result is unpredictable (it depends on interleaving of threads' actions).
+\end{description}
+
+\section{Why memory bugs are dangerous?}
+Let's focus on what really can happen when a memory error occurs. Most such errors cause \textit{undefined behavior} \cite{bib:undefined-behavior} so the result may be unpredictable. For instance, C~standard states that the behavior of dereferencing a null pointer is undefined (\cite{bib:nullptr-ub}, clause 6.5.3.2, paragraph 4), and Linux Programmer's Manual states that freeing a heap object more than once is also undefined \cite{bib:double-free-ub}. Here some are some real-life examples of what such undefined behaviors can mean:
+\begin{itemize}
+    \item The program crashes immediately (e.g. due to receiving a \texttt{SIGSEGV} signal in user-space or a hardware exception that leads to a kernel panic in kernel-space).
+    \item The program modifies its memory (it can be a local variable but also memory allocator's metadata) in an unpredictable way which then leads to erroneous results.
+    \item The program modifies its memory in an unexpected way (from the programmer's point of view) that can be controlled by an attacker -- say, user providing program's input. This can lead to dangerous security vulnerabilities such as privilege escalation or arbitrary code execution.
+\end{itemize}
+
+Below you will find two simple examples of the third, most dangerous, option.
+
+\subsection{Buffer overflow example}
+
+Listing \ref{lst:buffer-overflow} contains code which reads two values from the standard input: username and whether or not the given user has admin privileges. Then it adds the user to some database. The buffer for username has 16 bytes (line 26) but is copied to \texttt{user\_t::name} buffer which has 8 bytes (line 7), using unsafe \texttt{strcpy} function\footnote{\texttt{strcpy} does not take the buffer's length into account, thus is able to overflow the destination buffer \cite{bib:strcpy}.}. If one specifies a name longer than 8 bytes, variable \texttt{user\_t::is\_admin} will be overwritten by non-zero value.
+
+\begin{lstlisting}[language=C, caption=A code containing buffer overflow bug., label={lst:buffer-overflow}]
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+typedef struct {
+  char name[8];
+  bool is_admin;
+} user_t;
+
+void add_user(const char *name, bool is_admin) {
+  user_t *user = malloc(sizeof(user_t));
+
+  /* copy user data */
+  user->is_admin = is_admin;
+  strcpy(user->name, name); /* potential buffer-overflow! */
+  
+  /* ... add user to the database ... */
+
+  if (user->is_admin)
+    puts("New admin created");
+}
+
+int main(int argc, char *argv[]) {
+  /* read name and privileges from stdin */
+  char name[16];
+  int is_admin;
+  scanf("%s %d", name, &is_admin);
+
+  add_user(name, is_admin);
+
+  return 0;
+}
+\end{lstlisting}
+
+Let's see what will happen if we run the code and create a user with name ,,LongUserName'' (more than 8 bytes) and no admin privileges.
+
+\begin{lstlisting}[caption=Exploiting buffer overflow bug in listing \ref{lst:buffer-overflow}.]
+$ gcc buffer-overflow.c -o buffer-overflow
+$ echo "LongUserName 0" | ./buffer-overflow
+New admin created
+\end{lstlisting}
+
+We clearly see that \texttt{user\_t::is\_admin} variable has been overwritten by buffer overflow and the user now is an admin (line 21)!
+
+Moreover, another issue is that creating an admin with 8-byte name is not possible since a null byte that follows the name would overwrite \texttt{user\_t::is\_admin}.
+
+\subsection{Use-after-free example}
+Other types of memory bugs can be exploited as well. Listing \ref{lst:use-after-free} contains vulnerable code with use-after-free bug. The code is inspired by task ,,Heap Two'' from Exploit Education website \cite{bib:protostar-bib2}. Let's analyse what it does: there are two global pointers (\texttt{user\_auth} and \texttt{user\_name}, lines 10-11) to some user authentication data and username. There is also an infinite loop that reads commands from the standard input and depending on the command:
+\begin{description}
+    \item[Command \texttt{auth}] The program allocates new user authentication data (that contains \texttt{auth\_t::logged\_in} variable) and zeroes it (lines 22-24).
+    \item[Command \texttt{reset}] The program frees current user authentication data, but is not zeroing the \texttt{user\_auth} pointer (lines 25-26).
+    \item[Command \texttt{name {[}arg{]}}] The program allocates a buffer for username and copies \texttt{arg} to the buffer (lines 27-28).
+    \item[Command \texttt{auth}] The program inspects \texttt{user\_auth->logged\_in} variable in order to check whether the current user is logged in (lines 29-34).
+\end{description}
+\begin{lstlisting}[language=C, caption=A code containing use-after-free bug., label={lst:use-after-free}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+  /* ... some auth data ... */
+  int logged_in;
+} auth_t;
+
+auth_t *user_auth;
+char *user_name;
+
+int main() {
+  while (1) {
+    printf("[ auth = %p, name = %p ]\n", user_auth, user_name);
+
+    char command[128];
+    /* read command */
+    fgets(command, sizeof(command), stdin);
+
+    /* check which command has been given */
+    if (strncmp(command, "auth", 4) == 0) {
+      user_auth = malloc(sizeof(auth_t));
+      memset(user_auth, 0, sizeof(auth_t));
+    } else if (strncmp(command, "reset", 5) == 0) {
+      free(user_auth);
+    } else if (strncmp(command, "name", 4) == 0) {
+      user_name = strdup(command + 5);
+    } else if (strncmp(command, "login", 5) == 0) {
+      if (user_auth->logged_in) { /* potential use-after-free! */
+        printf("logged in successfully!\n");
+      } else {
+        printf("failed to log in!\n");
+      }
+    }
+  }
+}
+\end{lstlisting}
+
+The bug is that the command \texttt{reset} is not zeroing \texttt{user\_auth} pointer after deallocating the data. There is a chance that giving \texttt{name} command just after \texttt{reset} will make \texttt{user\_auth} and \texttt{user\_name} point to the same buffer, as \texttt{strdup} function (line 28) calls \texttt{malloc} internally \cite{bib:strdup}. If so, \texttt{user\_auth->logged\_in} refers to bytes within username that one can control (and write non-zero data there).
+
+\begin{lstlisting}[caption={Exploiting use-after-free bug in listing \ref{lst:use-after-free}. Note that after \texttt{name} command both pointers have the same value.}]
+$ gcc use-after-free.c -o use-after-free
+$ ./use-after-free
+[ auth = (nil), name = (nil) ]
+auth
+[ auth = 0x56241e340a80, name = (nil) ]
+login
+failed to log in!
+[ auth = 0x56241e340a80, name = (nil) ]
+reset
+[ auth = 0x56241e340a80, name = (nil) ]
+name John
+[ auth = 0x56241e340a80, name = 0x56241e340a80 ]
+login
+logged in successfully!
+\end{lstlisting}
+
+Of course there are many other, sometimes very sophisticated, ways of exploiting security vulnerabilities in languages like C and C++. For more information I'd recommend reading various security-related books (e.g. \cite{bib:secure-c-cpp}), blogs (e.g. \cite{bib:gynvael-blog}, \cite{bib:project-zero}, \cite{bib:mazur}), or reading write-ups of tasks from CTF competitions\footnote{CTF (Capture The Flag) is a kind of information security competitions in which tasks are solved by exploiting security vulnerabilities.}.
+
+\section{Generic ways of detecting memory bugs}
+There are many techniques that one can use in order to detect memory errors in both user-space and kernel-space. The techniques, and tools that implement them, differ in:
+\begin{itemize}
+    \item when the errors are detected (e.g. during compile time or run time),
+    \item what types of errors are detected (e.g. some tools specialise in detecting concurrency issues only),
+    \item what is the time and memory overhead.
+\end{itemize}
+
+Below you will find some general approaches to finding memory errors.
+
+\subsection{Formal verification}
+Formal verification is the process of checking whether a design satisfies some requirements (properties) \cite{bib:formal-verification-1}. It can be achieved i.a. using model checking or theorem proving \cite{bib:formal-verification-2}. Some interesting examples include:
+\begin{itemize}
+    \item CompCert compiler \cite{bib:compcert}. CompCert is a compiler for the C programming language that has been formally verified using Coq, an interactive theorem prover.
+    \item Formal verification of seL4 microkernel \cite{bib:seL4}. According to the authors, it is a first formal proof of functional correctness of a complete, general-purpose OS. In this case, Isabelle theorem prover has been used.
+\end{itemize}
+\subsection{Other types of static analysis}
+In general, static analysis is a kind of analysis performed without running a program. There are many standalone tools able to detect errors that way, not to mention the ones built into IDEs and compilers. As far as C and C++ languages are concerned, it's worth noting that GCC 10 (next major release of GCC compiler) will have a brand new static analysis pass, able to detect e.g. some double-free bugs, that one can launch using \texttt{-fanalyzer} flag \cite{bib:gcc-10}.
+
+\subsection{Code instrumentation}
+Instrumentation is a technique widely used in software profiling, virtualization, but also in error detection. It involves adding extra code to an application, either at compile time (static instrumentation) or at run time (dynamic instrumentation) \cite{bib:software-instrumentation}. Such additional code performs safety checks. Examples include:
+\begin{itemize}
+    \item \texttt{libstdc++}'s debug mode, which requires additional \texttt{-D\_GLIBCXX\_DEBUG} compiler flag, and enables many run-time assertions detecting incorrect usage of the standard library (like \texttt{std::vector}'s out-of-bounds access) \cite{bib:libstdc++-debug},
+    \item Stack canaries -- modifying functions' prologues and epilogues. In prologue, a randomly chosen integer (called canary) is placed on stack. In epilogue, the integer's value is checked to make sure it hasn't changed \cite{bib:stack-canaries}. If it has, then stack buffer overflow is reported. This technique increases the difficulty of overwriting function's return address (stored within stack frame). Canaries can also be used by memory allocators -- such allocator would then put a canary just after an allocated buffer.
+    \item Address Sanitizer (ASan) -- a tool which adds a run time check before each memory access in order to make sure that the access is valid. If it's not, an error is reported. Kernel variant of the tool (KASan) will be discussed in more detail in next chapters.
+\end{itemize}
+\subsection{Dynamic recompilation}
+The term simply means recompiling a program (or its parts) during execution. Although dynamic recompilation is commonly used in emulators and virtual machines, it can also prove to be useful for finding memory bugs. For example, Valgrind -- a well known memory debugging and profiling tool, translates the analysed program's machine code into an architecture-neutral intermediate representation (IR). Subsequently, the IR is modified (e.g. instrumented, depending on which mode was chosen) and then converted back into machine code (\cite{bib:valgrind}, section 3.2). Valgrind itself runs on real CPU and the analysed program runs on (conceptually) simulated CPU, so this approach shares some similarities with virtualization.
+
+\subsection{Fuzzing}
+Fuzzing is a way of testing the security of a program by programmatically providing it with many (valid or invalid) inputs, and seeing if the program crashes or exhibits other insecure behavior \cite{bib:fuzzing}. It's even more effective when used with other techniques like code instrumentation which will cause the tested program to crash immediately when an error is detected (instead of falling into undefined behavior). Many modern browsers, OS kernels etc. are constantly being fuzzed in order to find more and more overflows, race conditions, leaks, and the like.
+
+\chapter{Tools for finding memory bugs in the kernel-space}
+\label{chapter:3}
+In this chapter you will find an overview of various tools that modern OS kernels use to detect memory errors. The overview is not exhaustive, but covers all types of errors mentioned in chapter \ref{chapter:2}, and presents tools from a number of OSes like: Linux, Windows, macOS/iOS (XNU kernel), NetBSD, and FreeBSD.
+
+\section{kmemcheck}
+\label{lbl:kmemcheck}
+This tool was present in the Linux kernel for ten years, from 2007 to 2017. It was removed as right now the kernel sanitizers (described below in section \ref{section:3-sanitizers}) can detect even more errors with less overhead \cite{bib:memcheck-sanitizers-1} \cite{bib:memcheck-sanitizers-2}. I mention it in the thesis to show how the techniques have improved over time.
+
+Generally speaking, kmemcheck is a dynamic checker for uninitialized memory usage. Here's how it works \cite{bib:lwn-kmemcheck}:
+\begin{itemize}
+    \item each allocation of a memory page in the kernel allocates an additional \textit{shadow}\footnote{Shadow memory is a way of keeping metadata about the main memory. Each byte in the shadow memory contains information about some chunk of original memory (in this case, the mapping is one byte to one byte). The technique is used in various dynamic analysis tools and more examples are discussed later in this thesis.} page, initially filled with zeros, which is a map showing which bytes in the original page have been already initialized,
+    \item the kernel's page table is modified so that each access to the original page generates a page fault\footnote{Page table is a structure that keeps the mappings between virtual and physical addresses. Each mapping (also called PTE, \textit{page table entry}) contains additional metadata (e.g. permissions) which can be modified so that a page fault is raised when accessing the virtual address (\cite{bib:csapp}, section 9.3.2).},
+    \item if the page fault happens and it's a write, the corresponding bytes in the shadow page are marked as \texttt{0xFF} (initialized) and the execution is resumed; on the other hand, if it's a read, and at least one of the corresponding shadow bytes is equal to \texttt{0x00} (uninitialized), an error is reported.
+\end{itemize}
+
+The memory consumption is doubled as compared to uninstrumented case, but the time overhead is even more severe due to the handling of page faults. Thus, the tool can only be used while debugging the kernel and is not suitable for regular workloads.
+
+\section{kmemleak}
+A tool for detecting memory leaks built into the Linux kernel \cite{bib:kernel-org-memleak}. It works similarly to garbage collectors, but instead of freeing unused objects, it reports them as leaked. More specifically, all memory allocations in the kernel are tracked: pointer to a block, its size and other data are stored in a red-black tree. Deallocations are also tracked, as they remove a corresponding entry from the tree.
+
+Every ten minutes (configurable interval) a thread scans the entire kernel memory (including registers, stacks, data section) and reports information about data leaks, i.e. all allocated blocks from the red-black tree that are not referenced from the memory.
+
+The tool allows some false positives and false negatives to happen, partially to keep the algorithm simple.
+\section{KLEAK}
+KLEAK \cite{bib:kleak-paper} is a feature able to detect kernel memory disclosures, which was added to NetBSD in 2020 \cite{bib:netbsd-9-notes}. Kernel memory disclosure is a use of uninitialized memory error subtype, occurring when uninitialized data is copied to the user-space. Such data may contain secrets like cryptographic private key or information about kernel memory layout (letting an attacker bypass KASLR\footnote{Kernel address space layout randomization (KASLR), a technique that prevents exploitation of some bugs by randomizing the kernel virtual address space \cite{bib:lwn-kaslr}.}).
+
+KLEAK uses a simple form of taint tracking: memory returned by kernel heap allocators, which isn't requested to be zeroed, is filled with a repeated 1-byte marker. Also, compiler instrumentation is used to dynamically taint parts of the stack with the marker -- it cannot be done once as the kernel continuously uses the stack, possibly overwriting the taint.
+
+Memory is exchanged between the kernel-space and the user-space using a few specific functions like \texttt{copyout} or \texttt{copyoutstr} \cite{bib:copy-bsd}. Those functions are instrumented as well -- if the marker is detected in any buffer crossing the kernel boundary, a disclosure is reported.
+
+\section{InitAll}
+InitAll \cite{bib:initall} is a mechanism created by Microsoft in order to eliminate uninitialized stack memory vulnerabilities. It automatically initializes all stack variables during compilation (in front-end of the compiler). The rationale is that static analysis, fuzzing and code review were not effective enough to deal with this class of vulnerabilities.
+
+More specifically, InitAll fills uninitialized local variables (scalars, arrays, structures) with a pattern of either \texttt{0x00} or \texttt{0xE2} bytes, depending on the Windows kernel build. According to Microsoft Security Response Center, zero initialization is the best in terms of performance, code size and security properties. Although, in some cases it may lead to unexpected results, for instance when an uninitialized pointer goes down a ,,NULL pointer'' branch instead of causing a crash whilst being dereferenced.
+
+Microsoft reports that since InitAll has been added to the Windows kernel in 2019, multiple vulnerability reports stopped being reproducible on the latest versions of the system.
+
+\section{Sparse}
+Sparse (Semantic Parser for C) \cite{bib:sparse} is a tool for static code analysis of the Linux kernel. It was originally written by Linus Torvalds. Sparse can find a variety of errors, also the kernel-specific ones.
+
+The tool allows the programmer to annotate the code so that even more issues are detected. For instance:
+\begin{itemize}
+    \item for a given lock \texttt{L}, functions can be marked with \texttt{\_\_must\_hold(L)},  \texttt{\_\_acquires(L)} or \texttt{\_\_releases(L)} (invalid usage of locking primitives is reported by Sparse as \textit{context imbalance}, see example report below),
+    \item pointer types can be annotated with \texttt{\_\_user} or \texttt{\_\_kernel} (Sparse verifies whether a kernel pointer isn't passed as a user pointer, or whether a user pointer isn't directly dereferenced\footnote{Kernel code mustn't directly use addresses provided by a user (e.g. via a system call's argument) since they may be invalid. In the Linux kernel, functions like \texttt{copy\_to\_user} and \texttt{copy\_from\_user} must be used instead (\cite{bib:linux-kernel-arch}, section 4.13).}),
+    \item integer types can be annotated with \texttt{\_\_bitwise} to create a restricted type that can only be used with bitwise operations and cannot be mixed with other integer types (e.g. to define little-endian and big-endian integer types).
+\end{itemize}
+
+Such annotations can be easily found whilst reading the kernel code. In the Linux kernel~5.0, macro \texttt{\_\_user} is referenced in 2389 files \cite{bib:linux-user-macro}, macro \texttt{\_\_releases} in 243 files \cite{bib:linux-releases-macro}.
+
+Here are some examples of warnings issued by Sparse while verifying the Linux kernel, taken from \cite{bib:sparse-examples}:
+\begin{lstlisting}[caption=Examples of warnings generated by the Sparse tool.]
+mm/slub.c:2830:47: warning: context imbalance in '__slab_free' - unexpected unlock
+drivers/gpu/drm/i915/i915_debugfs.c:4351:29: warning: Variable length array is used.
+drivers/scsi/eata.c:1652:13: warning: cast to restricted __be32
+kernel/bpf/sockmap.c:332:43: warning: Using plain integer as NULL pointer
+drivers/gpio/gpio-pci-idio-16.c:120:27: warning: dereference of noderef expression
+drivers/iommu/amd_iommu.c:3598:21: warning: symbol 'stupid_workaround' was not declared. Should it be static?
+\end{lstlisting}
+
+\section{Sanitizers}
+\label{section:3-sanitizers}
+To begin with, let's briefly discuss user-space sanitizers -- they're a set of tools designed by Google that perform dynamic analysis of mainly C and C++ programs. Most popular examples are: Address Sanitizer (ASan, detects overflows and uses of freed memory), Memory Sanitizer (MSan, detects uninitialized memory), Thread Sanitizer (TSan, detects data races) and Undefined Behavior Sanitizer (UBSan, detects undefined behaviors). All sanitizers require compiler support (for code instrumentation), run-time support (a dedicated run-time library) and most of them use shadow memory (the concept of shadow memory was explained in section \ref{lbl:kmemcheck}).
+
+The ASan was among the first sanitizers that the GCC compiler began to support in 2013 \cite{bib:gcc-4.8-changes}. It provides little run-time overhead compared to other similar tools \cite{bib:asan-paper} and since its release it has found numerous bugs in various applications, including Chrome, Firefox, Vim, LLVM and even GCC itself \cite{bib:asan-found-bugs}. Its kernel-space counterpart, the KASan, was integrated into the Linux kernel in 2015 \cite{bib:linux-kasan} and has also found many errors \cite{bib:linux-kasan-found}. Both tools use the same method of finding bugs, although implementing the latter is more difficult.
+
+Today we can find various sanitizers built into more and more widely-used OS kernels, like: Linux, *BSDs, macOS. The compile-time instrumentation (support from GCC and LLVM) gives the sanitizers an advantage over other similar tools in terms of performance.
+
+The following section gives an outline of how all the kernel sanitizers work. Please note that the KASan is discussed in greater detail in chapter \ref{chapter:4}.
+
+\subsection{Kernel Address Sanitizer}
+The KASan uses shadow memory to keep information about validity of each byte in the main memory (eight original bytes map to one shadow byte). Moreover, the compiler instruments the code by adding a shadow check before each memory access.
+For instance, the following code:
+\begin{lstlisting}[language=C]
+*ptr = 42; /* store of size 8 */
+\end{lstlisting}
+would be changed to:
+\begin{lstlisting}[language=C]
+__asan_store8(ptr);
+*ptr = 42; /* store of size 8 */
+\end{lstlisting}
+
+Where \texttt{\_\_asan\_store8} function has to be implemented by KASan's run-time library. Basically, it should check the corresponding shadow byte and report an error if \texttt{ptr} points to an invalid address. Other \texttt{\_\_asan\_*} methods are discussed in the next chapter.
+
+Furthermore, the compiler adds redzones (additional memory marked as invalid, or \textit{poisoned}, in the shadow area) after global and local variables, so when an overflow happens, it's immediately reported by the KASan. Such redzones are also inserted by kernel memory allocators (or by \texttt{malloc}, as far as ASan is concerned) after each allocated block.
+
+Use-after-free bugs are detected by poisoning deallocated memory blocks until they're returned by some subsequent allocation request. A quarantine that delays reuse of freed blocks can be introduced to reduce the number of false negatives.
+
+\subsection{Kernel Hardware-Assisted Address Sanitizer}
+KHWASan \cite{bib:lwn-khwasan} is a mode of KASan that relies on Top Byte Ignore (TBI) feature of ARMv8 processors. This sanitizer is based on a memory tagging approach:
+\begin{itemize}
+    \item each 16 bytes of main memory can be marked with a 1-byte tag, stored in the shadow memory,
+    \item each pointer has a tag, stored within its top byte (due to TBI, the tag is ignored while dereferencing the pointer)\footnote{64-bit architectures like x86-64 or AArch64 (ARMv8) currently support a 48-bit virtual address space, so 64-bit pointers don't use their top bytes anyway.},
+    \item when heap memory is allocated: a random tag $T$ is generated, the returned memory is marked with $T$ in the shadow area, and $T$ is embedded into the returned pointer,
+    \item memory accesses are instrumented, similarly as for KASan, and an error is reported when memory tag mismatches pointer tag.
+\end{itemize}
+
+Let's compare the two sanitizers: KWHASan uses 1:16 shadow ratio instead of KASan's 1:8 to reduce memory overhead but the drawback is that each tagged memory chunk has to be aligned to 16 bytes. Moreover, the hardware-assisted tool can only detect off-by-one overflow if it crosses a 16-byte boundary. Also, because of a limited number of possible tag values (256), there's a 0.4\% probability of an error being missed. However, KHWASan has a big advantage: it can detect an overflow no matter how large it is (with no redzones required), and a use-after-free no matter how long ago the memory was deallocated (with no quarantine required).
+
+Please note that KASan does not use memory tagging, as it only keeps information about validity of each byte from the main memory.
+
+\subsection{Kernel Undefined Behavior Sanitizer}
+Many undefined behaviors (UB) in C/C++ cannot be detected using static code analysis. For instance, evaluating expression \texttt{42 / x} causes UB only if the integer \texttt{x} is equal to zero. Of course, \texttt{x}'s value may not be available during compilation. That's why a run-time tool is needed.
+
+The KUBSan \cite{bib:kubsan-openbsd} is a run-time checker for undefined behaviors. When it's enabled, the compiler instruments the kernel code by adding checks that detect:
+\begin{itemize}
+    \item division by zero,
+    \item invalid bitwise shift operation (e.g. shifting by a negative number),
+    \item signed integer overflow as a result of addition, subtraction, multiplication or negation,
+    \item NULL pointer dereference,
+    \item storing a value other than \texttt{true} or \texttt{false} into a boolean,
+    \item etc.
+\end{itemize}
+
+When such error is noticed, appropriate \texttt{\_\_ubsan\_handle\_*} function (that has to be implemented by the kernel's run-time) is called.
+
+The KUBSan does not require shadow memory nor any initialization, as opposed to the other sanitizers.
+
+\subsection{Kernel Memory Sanitizer}
+The KMSan \cite{bib:msan-paper} \cite{bib:kmsan-github} is a detector of uninitialized memory usage. It uses shadow memory (1:1 mapping, so for each bit of kernel memory the tool keeps one shadow bit) to keep track of uninitialized data. Shadow bit \texttt{0x0} stands for initialized (defined) and \texttt{0x1} for uninitialized (undefined).
+
+The tool uses compiler instrumentation and a run-time library to:
+\begin{itemize}
+    \item detect when an uninitialized variable is used,
+    \item perform \textit{shadow propagation} -- which means that the state of being undefined propagates through variables, e.g. adding two variables that are marked as undefined yields an undefined result,
+    \item track origin of uninitialized data, since a value may undergo multiple copies and transformations between allocation and usage (this greatly eases understanding an error report).
+\end{itemize}
+
+The KMSan has significantly lower overhead than the \texttt{kmemcheck} described in section \ref{lbl:kmemcheck}. Note that due to the lack of compile-time instrumentation, \texttt{kmemcheck} intercepts memory accesses by causing them to trigger page faults.
+
+\subsection{Kernel Thread Sanitizer}
+This sanitizer \cite{bib:google-ktsan} is a dynamic data-race detector. It tracks memory accesses, scheduler operations and usage of locking primitives to calculate a happens-before relation which is then used to detect race conditions. The algorithm is described thoroughly in \cite{bib:tsan-algorithm}.
+
+The KTSan uses shadow memory to store a history of memory accesses. For each 8 bytes of kernel memory there are 32 bytes of shadow memory which contain the information about a few last accesses to these 8 bytes.
+
+There is also an alternative data-race detector based on the same compiler instrumentation but with different run-time library: the Kernel Concurrency Sanitizer (KCSan) \cite{bib:lwn-kcsan}. It has smaller performance overhead and memory overhead (as it doesn't use shadow memory) but is less precise and cannot detect some ,,subtle bugs, such as a missing memory barrier''.
+
+\section{syzkaller}
+syzkaller is an unsupervised kernel fuzzer \cite{bib:syzkaller}. It generates C programs that use system calls, looking for the codes that will cause a kernel crash. Many OSes are supported, i.a. Linux, *BSDs and Windows. The fuzzer is coverage-guided which means that it measures how much of the kernel code was executed while running the C~program (using kcov \cite{bib:kcov}, a tool for measuring kernel code coverage). The C~program is constantly mutated to increase the coverage and detect more errors. The whole process is even more efficient when the fuzzed kernel is built with one of the sanitizers, as they make latent bugs cause an immediate crash.
+
+There's also syzbot, a bot that constantly fuzzes a number of kernels using syzkaller and reports the results online \cite{bib:syzbot}. For instance, we can see that NetBSD is being fuzzed using a regular kernel build, but also using builds with KMSan and KUBSan enabled. Furthermore, the Linux kernel is fuzzed using KASan, KMSan and KCSan builds. Over the last three years, syzbot has found approx. 3000 bugs in the Linux kernel, with approx. 700 of them still waiting to be fixed. That gives nearly 3 bugs per day.
+
+\section{Compile-time debug options}
+Last but not least, many OS kernels can be compiled with debug options that enable additional run-time checks (usually assertions that cause a kernel panic when evaluated to \texttt{false}). In a regular kernel build such checks are not that frequent due to the time and memory constraints.
+
+Each system has its own unique debug options which can be kernel-wide, subsystem-wide or even file-wide. As an example, here are some options from the NetBSD kernel. Please note that the list is not exhaustive.
+\begin{itemize}
+    \item Option \texttt{DIAGNOSTIC} \cite{bib:netbsd-options-4} -- adds internal consistency checks which will cause panic if corruption of internal data structures is detected. Decreases performance up to 15\%.
+    \item Option \texttt{LOCKDEBUG} \cite{bib:netbsd-options-4} -- adds code that detects incorrect use of locking primitives (e.g. deadlocks or when a memory being freed contains an initialised lock). Decreases performance up to a factor of three.
+    \item Option \texttt{KMEM\_SIZE} \cite{bib:netbsd-kmem-9} -- adds code to \texttt{kmem} memory allocator that compares whether the block size given in \texttt{kmem\_free()} matches the block size allocated using \texttt{kmem\_alloc()}. Any mismatch triggers a panic. Enabled by default in \texttt{DIAGNOSTIC} build.
+\end{itemize}
+
+The options have to be specified during compilation since they insert additional code via preprocessor directives like \texttt{\#ifdef}.
+
+Please note that all the tools mentioned in this chapter are able to detect various memory management bugs but are not always a mitigation against exploitation of undetected errors in production builds.
+Techniques designed to make kernel exploitation more difficult (e.g. Kernel address space layout randomization or ARM Pointer Authentication) are not within scope of this thesis, though.
+
+\chapter{Kernel Address Sanitizer in detail}
+\label{chapter:4}
+Here you can find a comprehensive description of how the KASan works. The description is independent of any particular system or processor architecture. A~MIPS-specific KASan implementation for the Mimiker OS is presented in chapter~\ref{chapter:5}.
+
+As the documentation for kernel sanitizers is limited, please note that the information below is mostly based on \cite{bib:asan-paper} and my own experiences of implementing the KASan in Mimiker, which involved: reading the code of sanitizers within the Linux \cite{bib:linux-kasan-code} and the NetBSD \cite{bib:netbsd-kasan-code} kernels and reading parts of the GCC source code related to sanitizers \cite{bib:gcc-kasan-code}.
+
+\section{Shadow memory}
+The tool needs a shadow memory that keeps information about validity of each byte in the main memory. As the mapping is eight original bytes to one shadow byte, in order to cover the whole memory, one-eight of the virtual address space is needed. The shadow address is calculated using a formula: \texttt{(address / 8) + offset}. The offset (also called \textit{the shadow offset}) is chosen for each architecture depending on where the shadow addresses reside within the virtual address space.
+
+Figure \ref{lbl:kasan-mapping} shows an example of a virtual address space layout and how its segments are mapped to one another using the aforementioned formula. The shadow area itself is mapped to a ,,bad'' region which is made inaccessible by setting appropriate bits in the page table.
+
+\begin{figure}[h]
+\label{lbl:kasan-mapping}
+\centering
+\includegraphics[width=0.8\textwidth]{kasan-mapping.png}
+\caption{The virtual address space mapping. Diagram taken from \cite{bib:asan-paper}.}
+\end{figure}
+
+Each shadow byte contains a value which means:
+\begin{itemize}
+    \item if it is equal to 0, the corresponding eight bytes are valid,
+    \item if it is equal to $k$, where $1 \leq k \leq 7$, only the first $k$ bytes are valid,
+    \item otherwise, the corresponding eight bytes are invalid.
+\end{itemize}
+In the third case, different shadow values indicate different types of poisoned memory. For instance, redzones after local variables have a unique shadow value which lets the tool distinguish between stack buffer overflow and other types of bugs.
+
+Below you will find a pseudocode that checks validity of a 8-byte access to address \texttt{addr}:
+\begin{lstlisting}
+shadow_addr = (addr / 8) + offset;
+shadow_value = *shadow_addr;
+if (shadow_value != 0)
+  report_error();
+\end{lstlisting}
+and here's is a check for a smaller access of size \texttt{len}:
+\begin{lstlisting}
+shadow_addr = (addr / 8) + offset;
+shadow_value = *shadow_addr;
+last_byte = (addr + len) mod 8;
+if (shadow_value != 0 && shadow_value < last_byte)
+  report_error();
+\end{lstlisting}
+
+Such check is performed before every memory access, as explained below.
+
+\section{Compiler instrumentation}
+The sanitization is enabled by passing \texttt{-fsanitize=kernel-address} flag during compilation. Then, the compiler instruments the code in many places by inserting \texttt{\_\_asan\_*} function calls. However, the compiler doesn't deliver their implementation~-- it's the sanitizer's run-time library that has to implement them. Since such library contains parts that are system-specific or even architecture-specific, it must be created independently for each OS kernel.
+
+Now let's see some examples of \texttt{\_\_asan\_*} methods and where they're inserted:
+\begin{itemize}
+    \item \texttt{\_\_asan\_readN} (\texttt{\_\_asan\_writeN}) call is added before each read (write) of size \texttt{N} to check its validity,
+    \item \texttt{\_\_asan\_register\_globals} call is added to an \textit{initialization routine} of each file that contains global variables -- addresses of such routines can be found in \texttt{.ctors} object file segments and are used by the run-time library to poison redzones after global variables during kernel boot process (for more information about initialization routines in GCC, see \cite{bib:gcc-initialization}),
+    \item \texttt{\_\_asan\_alloca\_poison} call is added when the compiler allocates memory of non-compile-time size on the stack in order to create redzones for the allocated memory,
+    \item \texttt{\_\_asan\_handle\_no\_return} call is added at the end of functions marked by \texttt{noreturn} specifier -- in Mimiker it's used to perform a cleanup of current stack's shadow memory, but some OS kernels implement this method as no-op.
+\end{itemize}
+
+Each function that uses local variables is also instrumented. The injected code dynamically creates redzones after stack variables, but in order to poison (in function prologue) and unpoison (in function epilogue) them, the shadow offset must be known during compilation. Therefore, one has to specify it using \texttt{-fasan-shadow-offset} flag.
+
+Moreover, memory for redzones after global variables is added statically by the compiler. For example:
+\begin{lstlisting}[language=C]
+int global; /* 4 bytes */
+\end{lstlisting}
+may be changed, depending on redzone size, to:
+\begin{lstlisting}[language=C]
+struct {
+  int original; /* 4 bytes */
+  char redzone[60];
+} global;
+\end{lstlisting}
+
+Please note that the instrumentation (e.g. whether or not stack accesses are instrumented) is fully customizable via different KASan compiler flags. For more information, please refer to section \ref{lbl:kasan-build-system}, where changes in Mimiker's build systems are discussed.
+
+\section{Run-time library}
+\label{lbl:chapter-4-run-time}
+The sanitizer needs a kernel library that implements the following:
+\begin{itemize}
+    \item various \texttt{\_\_asan\_*} functions that the compiler inserts into the code,
+    \item error reporting,
+    \item interface for the rest of the kernel that allows modifying the shadow memory, mainly for allocators as they need to poison and unpoison memory blocks,
+    \item initialization of the shadow memory, which is greatly machine-dependent (it requires, among other things, altering the page table) and should be called during early kernel boot process,
+    \item poisoning of redzones after global variables, 
+    \item wrappers for functions implemented in assembly language -- as the assembly code is not instrumented by the compiler, and some functions like \texttt{memcpy} or \texttt{copyin}~\cite{bib:copy-bsd} tend to be written in asm, the run-time library can create wrappers for them that additionally perform shadow memory checks,
+    \item etc.
+\end{itemize}
+
+\section{Instrumentation of allocators}
+\label{lbl:instrumentation-allocators}
+Everything mentioned earlier enables the kernel to detect invalid accesses to local and global variables. With appropriate changes in kernel's memory allocators, heap overflows and use-after-free bugs will be detected as well. The allocators can be modified in many ways, but the most common one is to do the following:
+\begin{itemize}
+    \item each allocation request returns memory block with an (already poisoned) redzone after the requested space -- bigger redzones increase memory overhead but let the sanitizer detect larger overflows,
+    \item deallocation of a memory block poisons the whole block, so that a use-after-free bug can be detected,
+    \item deallocated blocks are kept in a quarantine, which means that they won't be returned upon an allocation request anytime soon (so even more use-after-free errors are detected),
+    \item additional information like the allocation call stack or thread ID are stored inside redzones -- when the sanitizer reports an invalid heap access, it can use the information to provide more details (e.g. where and by whom the memory was allocated).
+\end{itemize}
+
+Please note that even though the Kernel Address Sanitizer obviously can miss some bugs (a long-delayed use-after-free, an overflow accessing addresses beyond the redzone), it cannot report false positives.
+
+\chapter{Kernel Address Sanitizer within the Mimiker OS}
+\label{chapter:5}
+
+As mentioned in chapter \ref{chapter:1}, Mimiker is an open-source OS developed at the University of Wrocław since 2015.
+It currently supports MIPS32 architecture only.
+The Mimiker project, in which I'm personally involved since mid-2018, is led by Krystian Bacławski \cite{bib:cahir}.
+As the codebase has been steadily growing for the last five years, some time ago I decided that it's a good time to integrate the Kernel Address Sanitizer into the Mimiker. Not only should it find bugs already present in the kernel but also (hopefully) prevent many more from being added in the future.
+
+In this chapter you will find how to use Mimiker's KASan, how it is implemented, and what errors it has already found. Please note that the implementation is partially based on the sanitizers within NetBSD and Linux kernel.
+
+\section{Example usage and bug report}
+All information about getting the Mimiker OS and all required packages, and then building and running it is available in a README file \cite{bib:mimiker-github}. However, if everything is already set up, building the kernel with KASan enabled is as simple as running \texttt{make~KASAN=1} (instead of \texttt{make}) command.
+
+The system has a unit test suite that can be run using \texttt{./launch~test=all} command. In order to see the sanitizer in action, let's add a buggy kernel unit test (please refer to listing \ref{lbl:kasan-example-test}) that contains a use-after-free in line 21. The memory error should be reported by the KASan when the test suite (containing the buggy test) is launched.
+
+\begin{lstlisting}[language=C, caption={Kernel unit test containing a use-after-free bug.}, label={lbl:kasan-example-test}]
+/* file sys/tests/kasan.c */
+#include <sys/mimiker.h>
+#include <sys/ktest.h>
+#include <sys/malloc.h>
+
+#define BUFSIZE 64
+
+static int buggy_test_kmalloc(void) {
+  /* allocate 64 bytes using kmalloc */
+  int8_t *ptr = kmalloc(M_TEMP, BUFSIZE, 0);
+
+  /* use the memory */
+  for (int i = 0; i < BUFSIZE; i++)
+    ptr[i] = 42;
+
+  /* free the memory */
+  kfree(M_TEMP, ptr);
+
+  /* use-after-free! */
+  for (int i = 0; i < BUFSIZE; i++)
+    assert(ptr[i] == 42);
+
+  return 0;
+}
+
+KTEST_ADD(buggy_test_kmalloc, buggy_test_kmalloc, 0);
+\end{lstlisting}
+Let's run all kernel tests:
+\begin{lstlisting}[caption=Example KASan report.]
+$ make KASAN=1 && ./launch -d test=all
+[...]
+Running test "buggy_test_kmalloc".
+===========KernelAddressSanitizer===========
+ERROR:
+* invalid access to address 0xc02d5c90
+* read of size 1
+* redzone code 0xff (kmalloc use-after-free)
+============================================
+[TEST FAILED]
+Failure while running multiple tests.
+  buggy_test_kmalloc  <---- FAILED
+\end{lstlisting}
+
+We can see a KASan report which states the error details. Specifying \texttt{-d} flag to our \texttt{launch} script enables debugging via \texttt{gdb}, which now can be used to see the exact location of the error.
+\begin{lstlisting}[caption={Example \texttt{gdb} backtrace (simplified) containing the error's location.}, label={lbl:gdb-backtrace}]
+(gdb) backtrace
+#0  panic_fail () at sys/kern/assert.c:6
+#1  0xc0133ed0 in ktest_failure () at sys/kern/ktest.c:65
+#2  0xc010ddc4 in shadow_check (size=0x1, addr=0xc0010c78) at sys/kern/kasan.c:172
+#3  __asan_load1_noabort (addr=0xc0010c78) at sys/kern/kasan.c:239
+#4  0xc014e134 in buggy_test_kmalloc () at sys/tests/kasan.c:21
+#5  0xc0134038 in run_test () at sys/kern/ktest.c:117
+#6  0xc01343fc in run_all_tests () at sys/kern/ktest.c:193
+#7  0xc013466c in ktest_main () at sys/kern/ktest.c:251
+#8  0xc0133aac in kmain () at sys/kern/main.c:20
+#9  0xc0121170 in thread_self () at sys/kern/thread.c:122
+\end{lstlisting}
+
+Listing \ref{lbl:gdb-backtrace} shows a result of running \texttt{backtrace} command within the \texttt{gdb} debugger.
+The backtrace (also called stack trace) is a report that describes all stack frames that were active when the KASan reported an invalid memory access.
+We can see that the running thread was executing kernel tests (frames 5-7) and crashed in \texttt{buggy\_test\_kmalloc} function (frame 4, file \texttt{sys/tests/kasan.c}, line 21).
+That's correct!
+
+For a list of actual bugs found by the sanitizer, please refer to section \ref{lbl:bugs-so-far}.
+
+\section{Implementation details}
+The implementation required modifying or creating over 20 files, with approximately 700 new lines of code added to the kernel. As it would be impossible to fully describe it here, in this section I present some key parts. Please note that:
+\begin{itemize}
+    \item all referenced files can be found online at Mimiker's GitHub repository \cite{bib:mimiker-github} or OpenGrok \cite{bib:mimiker-opengrok},
+    \item all GitHub pull requests that added KASan to Mimiker are marked with ,,KASAN'' milestone and can be found using this link: \cite{bib:mimiker-kasan-milestone}.
+\end{itemize}
+
+\subsection{Changes in the build system}
+\label{lbl:kasan-build-system}
+Mimiker OS is compiled using GNU Make. Mimiker's build system is rather complicated since the OS consists of many files and directories. Moreover, different rules and flags apply for kernel code and for user code (currently the OS provides several user-space programs like the \texttt{ksh} shell). The build system also supports choosing a target architecture -- it can be either MIPS32 or ARM64 -- but the implementation of Mimiker for ARM64 is still a work in progress.
+
+In order to add the KASan to the kernel, the build system had to be modified. The most important change was adding new rules to \texttt{build/arch.mips.mk} file (see listing \ref{lst:build-rules}). The rules can be described in the following way:
+\begin{itemize}
+\item All kernel files are now compiled with additional \texttt{-DKASAN=1} or \texttt{-DKASAN=0} flag, depending on whether the sanitizer is enabled. This enables us to use \texttt{\#if~KASAN} directive inside source code. It's needed, for instance, during kernel boot process: if KASan is turned on, we need to add additional entries to the page table that describe the shadow memory. Otherwise, the memory wouldn't be accessible.
+\item Files that are sanitized (i.e. all files except the run-time library and a file that e.g. initializes the page table) receive additional compiler flags defined within \texttt{CFLAGS\_KASAN} variable. These flags enable sanitization in \texttt{kernel-address} mode, enable instrumentation of specific memory access types (global, stack etc.) and set shadow memory offset.
+\end{itemize}
+
+\begin{lstlisting}[language=make, label={lst:build-rules}, caption={New build rules added to \texttt{build/arch.mips.mk} file.}]
+# Set KASAN flags
+ifeq ($(KERNEL), 1)
+KASAN ?= 0
+ifeq ($(KASAN), 1)
+  # Added to files that are sanitized
+  CFLAGS_KASAN = -fsanitize=kernel-address \
+                 -fasan-shadow-offset=0xD8000000 \
+                 --param asan-globals=1 \
+                 --param asan-stack=1 \
+                 --param asan-instrument-allocas=1
+endif
+# Added to all files
+CFLAGS += -DKASAN=$(KASAN)
+endif
+\end{lstlisting}
+
+\subsection{Shadow memory initialization}
+
+In order for the Kernel Address Sanitizer to work properly, the shadow memory has to be initialized. More specifically, the kernel has to:
+\begin{enumerate}
+    \item allocate physical memory for the shadow area,
+    \item map virtual shadow addresses to the allocated physical memory by adding appropriate entries in the page table,
+    \item zero (unpoison) the whole shadow area.
+\end{enumerate}
+
+Only after such process can the KASan be turned on, so it should happen as soon as possible.
+
+Let's focus on items 1. and 2. -- the most difficult ones. In Mimiker, they are implemented in the first C~function ever called from the assembly, that is in \texttt{mips\_init}. The function is responsible for, among other things, setting up the page table and the TLB\footnote{Translation lookaside buffer -- a cache of page table entries (\cite{bib:csapp}, section 9.6.2).}. Listing~\ref{lst:kasan-boot} shows a fragment of \texttt{mips\_init} that initializes the shadow area. Please note that variable \texttt{pte} is an array of page table entries and \texttt{pde} is an array of page directory entries -- the page table is hierarchical and has two levels. For more information about multi-level page tables, see (\cite{bib:csapp}, section 9.6.3).
+
+\begin{lstlisting}[language=C, caption={A fragment of \texttt{mips\_init} function, from file \texttt{sys/mips/boot.c}, that initializes the shadow memory (with additional comments).}, label={lst:kasan-boot}]
+#if KASAN /* Prepare KASAN shadow mappings */
+  /* Start of the virtual shadow area */
+  vaddr_t va = KASAN_MD_SHADOW_START;
+  /* Allocate physical memory for shadow area */
+  paddr_t pa = (paddr_t)bootmem_alloc(KASAN_MD_SHADOW_SIZE);
+  /* How many PDEs should we use? */
+  int num_pde = KASAN_MD_SHADOW_SIZE / SUPERPAGESIZE;
+  for (int i = 0; i < num_pde; i++) {
+    /* Allocate a new PT */
+    pte = bootmem_alloc(PAGESIZE);
+    /* Create PDE-PT mapping */
+    pde[PDE_INDEX(va)] = PTE_PFN((intptr_t)pte) | PTE_KERNEL;
+    /* Fill all entries inside PT */
+    for (int j = 0; j < PT_ENTRIES; j++) {
+      pte[PTE_INDEX(va)] = PTE_PFN(pa) | PTE_KERNEL;
+      va += PAGESIZE;
+      pa += PAGESIZE;
+    }
+  }
+#endif /* !KASAN */
+\end{lstlisting}
+
+Please notice symbols prefixed with \texttt{KASAN\_MD}. They belong to a machine-dependent part of the implementation, defined in file \texttt{include/mips/kasan.h}.
+
+\subsection{Interface}
+There's the sanitizer's interface -- a set of public functions that the kernel can call to interact with KASan. It basically contains:
+\begin{itemize}
+    \item a function to initialize the KASan's subsystem, that has to be called after the shadow memory is initialized,
+    \item a set of \textit{mark} functions to modify the shadow memory,
+    \item a set of \textit{quarantine} functions (the quarantine will be described in section \ref{lbl:heap-quarantine}).
+\end{itemize}
+
+\begin{lstlisting}[language=C, caption={The KASan's interface, a fragment of \texttt{include/sys/kasan.h} file.}, label={lst:kasan-interface}]
+/*  Initialize KASAN subsystem */
+void kasan_init(void);
+
+/* Mark bytes as valid (in the shadow memory) */
+void kasan_mark_valid(const void *addr, size_t size);
+
+/* Mark bytes as invalid (in the shadow memory) */
+void kasan_mark_invalid(const void *addr, size_t size,
+                        uint8_t code);
+
+/* Mark first 'size' bytes as valid (in the shadow memory) and the
+ * remaining (size_with_redzone - size) bytes as invalid with
+ * a given code. */
+void kasan_mark(const void *addr, size_t size,
+                size_t size_with_redzone, uint8_t code);
+
+/* Initialize given quarantine structure */
+void kasan_quar_init(quar_t *q, void *pool, quar_free_t free);
+
+/* Add an item to a quarantine */
+void kasan_quar_additem(quar_t *q, void *ptr);
+
+/* Release all items from a quarantine */
+void kasan_quar_releaseall(quar_t *q);
+\end{lstlisting}
+
+The functions are mostly used by heap allocators (to create redzones or quarantine memory blocks) and by the run-time itself. If the kernel is built without sanitization, all methods from listing \ref{lst:kasan-interface} are defined as no-op.
+Please note that \texttt{kasan\_mark}'s signature was inspired by its NetBSD's counterpart.
+
+\subsection{Linker script}
+As described in chapter \ref{chapter:4}, the compiler instrumentation uses initialization routines (also called \textit{constructors}) to make poisoning of global redzones feasible. Each object file gets a initialization routine that calls run-time \texttt{\_\_asan\_register\_globals} method, passing information about the file's globals and redzones that need to be poisoned. The address of such constructor is then stored in \texttt{.ctors} section of each object file.
+
+In order to have access to the constructors and call them during KASan initialization, the kernel linker script \cite{bib:linker-script} had to be modified. While linking object files into a single kernel executable, all \texttt{.ctors} sections should be gathered together and made accessible to the C code. This was achieved by adding new linker rules (listing \ref{lbl:linker-script}, lines 7-10) to Mimiker's linker script. Now the constructors are placed in kernel's \texttt{.text} section, visible between symbols \texttt{\_\_CTOR\_LIST\_\_} and \texttt{\_\_CTOR\_END\_\_}.
+
+\begin{lstlisting}[caption={A fragment of the kernel linker script from file \texttt{sys/mips/malta.ld}. Lines 7-10 were added.}, label={lbl:linker-script}]
+.text 0xc0102000 : AT(0x102000) ALIGN(4096)
+{
+  __kernel_start = ABSOLUTE(.);
+  __text = ABSOLUTE(.);
+  *(.text .text.*)
+  __etext = ABSOLUTE(.);
+  /* Constructors are used by KASAN to initialize global redzones */
+  __CTOR_LIST__ = ABSOLUTE(.);
+  *(.ctors)
+  __CTOR_END__ = ABSOLUTE(.);
+} : text
+\end{lstlisting}
+
+And now calling all constructors is as simple as:
+\begin{lstlisting}[language=C, caption={A fragment of function \texttt{call\_ctors} from file \texttt{sys/kern/kasan.c}.}]
+for (uintptr_t *ptr = &__CTOR_LIST__; ptr != &__CTOR_END__; ptr++) {
+  void (*func)(void) = (void (*)(void))(*ptr);
+  (*func)();
+}
+\end{lstlisting}
+
+\subsection{Run-time library}
+The run-time library, located at \texttt{sys/kern/kasan.c} path, contains what was mentioned in section~\ref{lbl:chapter-4-run-time}. It has over 300 lines of code, with an implementation of: all \texttt{\_\_asan\_*} methods, the interface for the rest of the kernel, error reporting, wrappers for several assembly functions etc.
+
+For instance, here you can see the sanitizer initialization that is called from method \texttt{platform\_init} while booting the kernel, right after the shadow memory is set up:
+\begin{lstlisting}[language=C, caption={Function \texttt{kasan\_init} from file \texttt{sys/kern/kasan.c}.}]
+void kasan_init(void) {
+  /* Set entire shadow memory to zero */
+  kasan_mark_valid((const void *)KASAN_MD_SANITIZED_START,
+                   KASAN_MD_SANITIZED_SIZE);
+  /* KASAN is ready to check for errors! */
+  kasan_ready = 1;
+  /* Setup redzones after global variables */
+  call_ctors();
+}
+\end{lstlisting}
+
+\subsection{Instrumentation of allocators}
+Currently the Mimiker's kernel provides the following allocators: \texttt{pool}, \texttt{kmalloc}, \texttt{kmem}, \texttt{bootmem}, \texttt{physmem}, \texttt{vmem}. As it may seem a lot compared to user-space (where usually one \texttt{malloc} suffices), more mature OS kernels tend to have even more. As an example, please refer to FreeBSD's allocators (\cite{bib:freebsd-book}, sections 6.2 and 6.3).
+
+To detect memory bugs related to accessing heap memory, the allocators were modified as described in section \ref{lbl:instrumentation-allocators}. Not all of them were instrumented, though~-- \texttt{bootmem} and \texttt{physmem} were omitted as they allocate physical memory, \texttt{vmem} was omitted as it's a general-purpose allocator, not only for memory. Also, \texttt{kmem} detects use-after-free bugs only -- overflows aren't tracked as the redzones would have to occupy 4~KiB per each allocation (\texttt{kmem} has page granularity). However, both \texttt{pool} and \texttt{kmalloc} were fully instrumented.
+
+The modified allocators can be found in the following files:
+\begin{itemize}
+    \item \texttt{sys/kern/malloc.c},
+    \item \texttt{sys/kern/pool.c},
+    \item \texttt{sys/kern/kmem.c}.
+\end{itemize}
+
+\subsection{Heap quarantine}
+\label{lbl:heap-quarantine}
+Quarantine was introduced to make finding use-after-free bugs easier~-- memory blocks after deallocation won't be immediately given to another request of allocation. Strictly speaking, quarantine is a structure added to each pool of heap items, with the following content:
+
+\begin{lstlisting}[language=C, caption=Quarantine structure defined in \texttt{include/sys/kasan.h} file.]
+typedef struct {
+  struct {
+    void *items[KASAN_QUAR_BUFSIZE];
+    int head;         /* first unoccupied slot */
+    int tail;         /* last occupied slot */
+    int count;        /* number of occupied slots */
+  } q_buf;            /* cyclic buffer of items */
+  quar_free_t q_free; /* function to free items after quarantine */
+  void *q_pool;       /* pool from which the items come */
+} quar_t;
+\end{lstlisting}
+
+The structure contains \texttt{q\_buf} -- a cyclic buffer of pointers to quarantined objects, \texttt{q\_free} -- a pointer to function to free unquarantined object (e.g. \texttt{\_kfree}), and \texttt{q\_pool} -- a pointer to the heap pool that the quarantine is related to.
+
+Let's look at an example usage: implementation of \texttt{kfree} (\texttt{kmalloc}'s procedure to free given memory block) function.
+
+\begin{lstlisting}[language=C, caption={Implementation of \texttt{kfree} function, from file \texttt{sys/kern/malloc.c} (with additional comments)}.]
+void kfree(kmalloc_pool_t *mp, void *addr) {
+  if (addr == 0)
+    return;
+  /* lock kmalloc's pool mutex */
+  SCOPED_MTX_LOCK(&mp->mp_lock);
+  /* mark the memory block as invalid in the shadow memory */
+  kasan_mark_invalid(addr, abs(addr_to_mem_block(addr)->mb_size),
+                     KASAN_CODE_KMALLOC_FREED);
+  /* add the memory block to the quarantine */
+  kasan_quar_additem(&mp->mp_quarantine, addr);
+#if !KASAN
+  /* without KASAN, call regular free method */
+  _kfree(mp, addr);
+#endif /* !KASAN */
+}
+\end{lstlisting}
+
+Function \texttt{kfree} is just a quarantine wrapper, whereas \texttt{\_kfree} is the regular deallocation function. When \texttt{kmalloc}'s quarantine runs out of space, it uses \texttt{\_kfree} (which is stored in \texttt{quar\_t::q\_free}) to free least recently added object.
+
+Please note that file \texttt{sys/kern/kasan\_quar.c} contains the implementation of all \texttt{kasan\_quar\_*} methods.
+
+\subsection{Moving kernel stack to virtual addresses}
+Last but not least, this section describes what else I was required to do in order to enable sanitization of stack accesses.
+
+The MIPS32 virtual address space is divided into five fragments: one user's \texttt{useg}, from \texttt{0x0000.0000} to \texttt{0x7FFF.FFFF}, and four kernel's \texttt{kseg0}-\texttt{kseg3}, cumulatively from \texttt{0x8000.0000} to \texttt{0xFFFF.FFFF} (\cite{bib:mips-architecture}, section 4.3). Kernel segments differ in whether or not they're mapped (translated through the TLB) or cached. All in all, the kernel should mainly use mapped and cached segments. However, unmapped ones can prove useful during early stages of OS development (note that they provide a window directly into the physical memory, so they're not really virtual).
+
+When I started integrating the KASan into the Mimiker OS, the Mimiker's kernel used \texttt{kseg2} segment (mapped \& cached) most of the time, but the kernel's stack still resided in \texttt{kseg0} (unmapped \& cached). Due to memory constraints, only \texttt{kseg2} has its corresponding shadow memory, so only memory accesses to that segment are sanitized by the KASan. Therefore, in order for the stack accesses to be sanitized, which is required to detect stack overflows, I had to move the kernel stack to the mapped \texttt{kseg2} segment.
+
+The main challenge was that accesses to stack can now trigger TLB Refill Exception -- a hardware exception that happens when requested virtual address is not present in the TLB, so the kernel needs to find the corresponding virtual-physical mapping in the page table and refill the TLB (\cite{bib:mips-architecture}, section 6.2.10). An occurrence of such exception was problematic in some assembly procedures that save (restore) CPU and FPU context onto (from) the stack\footnote{TLB Refill Exception overwrites several MIPS registers (e.g. \texttt{Status}, \texttt{Cause}, \texttt{EPC}, \texttt{BadVAddr}) which is troublesome if it occurs in a low-level procedure that tries to save the original values of these registers.}, so I had to partially rewrite these procedures. Full code change that moved the kernel stack from \texttt{kseg0} to \texttt{kseg2} can be found here: \cite{bib:github636}.
+
+
+\section{Overhead}
+Unfortunately, Mimiker does not currently support any dedicated benchmarking tools. However, there are over 100 kernel tests, some of them entering the user-space, and launching them sequentially can be used to approximate overall system performance and memory usage. Please note that the tests are always run in a random order so the measurements can vary to some extent between runs.
+
+The average time of running all tests is 52 seconds without KASan and 100 seconds with KASan enabled, which gives a 92\% slowdown. This overhead is comparable to up to 100\% slowdown reported for KASan in NetBSD \cite{bib:netbsd-kasan-slowdown} and 73\% for user-space ASan \cite{bib:asan-paper}.
+
+As far as the memory overhead is concerned, there are several factors that should be taken into account:
+\begin{itemize}
+    \item the shadow memory, which occupies 16~MiB -- it allows to sanitize 128~MiB (8~$\times$~16 MiB) of virtual addresses, a lot more than the kernel uses and will use in a near future,
+    \item global variables, which due to the redzones grew from 56~KiB to 127~KiB (2.3$\times$),
+    \item peak heap usage, which due to the redzones and quarantine grew on average from 32~KiB to 86~KiB (2.7$\times$) for \texttt{pool} allocator and from 59~KiB to 198~KiB (3.4$\times$) for \texttt{kmalloc} allocator,
+    \item stack usage, as local variables also have their redzones, but currently the kernel has no straightforward way to measure it, so I haven't done it.
+\end{itemize}
+
+Such overhead is definitely noticeable but not to an extent that would make the kernel unusable.
+
+\section{Bugs found so far}
+\label{lbl:bugs-so-far}
+Here is a list of bugs that the Kernel Address Sanitizer has reported in the existing codebase. Each has a reference to a corresponding GitHub issue or a pull request.
+\begin{itemize}
+    \item Buffer overflow in \texttt{strntoul} function (kernel's standard library)~\cite{bib:github635},
+    \item Stack buffer overflow in \texttt{videomode\_write} function (video driver)~\cite{bib:github647},
+    \item Stack use-after-return in \texttt{callout\_thread} (callout subsystem)~\cite{bib:github678},
+    \item \texttt{pool} use-after-free in \texttt{thread\_reap} function (thread subsystem)~\cite{bib:github645},
+    \item \texttt{pool} use-after-free in \texttt{device\_add\_resource} (device drivers infrastructure)~\cite{bib:github685},
+    \item \texttt{kmalloc} use-after-free in \texttt{tmpfs\_alloc\_dirent} function (tmpfs filesystem)~\cite{bib:github653},
+    \item \texttt{kmem} use-after-free in \texttt{ctx\_set\_retval} function (context management, but the bug was caused by a race condition in \texttt{kmem\_free} function)~\cite{bib:github705}.
+\end{itemize}
+
+Each Mimiker's code change is both reviewed and automatically verified by a~continuous integration tool which runs over 100 kernel tests.
+This procedure finds many errors at an early stage but some bugs (like the ones listed above) may still be difficult to detect without a~tool like the KASan.
+For instance, the use-after-free within \texttt{device\_add\_resource} function resulted from improper resource deallocation\footnote{,,Resource'' here means hardware resource, such as interrupt-request line, I/O port, or I/O memory. For more information, please see \cite{bib:freebsd-drivers}.} in GT-64120 PCI controller's driver. The driver lacked removing the resource from a corresponding device's tail queue before memory deallocation, so the tail queue contained a freed entry. The long-delayed use-after-free happened while adding another entry to the tail queue, as it requires modifying \textit{next} and \textit{prev} pointers of nearby (already freed) entries.
+
+All the errors have been already fixed: \cite{bib:github653} by Jakub Urbańczyk, \cite{bib:github678} by Krystian Bacławski, \cite{bib:github705} by Jakub Piecuch, and the rest by me. Please refer to GitHub for more details.
+
+\chapter{Conclusions}
+In this thesis I have discussed the memory management bugs, which are an inevitable part of every application or system. Moreover, I've described different ways of tackling them that are present in various modern OS kernels. One of such way is a tool named the Kernel Address Sanitizer, which in the past few years has been added to i.a. Linux, macOS and NetBSD.
+
+I have also presented an implementation of the Kernel Address Sanitizer for the Mimiker OS, specifically for MIPS32 architecture.
+The sanitizer is able to detect non-trivial buffer overflows and uses of freed memory without introducing much overhead.
+It has already proved to be valuable by finding a number of bugs and thus improving the Mimiker kernel's correctness and safety, not to mention bringing the University of Wrocław's system closer to the state of the art.
+More vulnerabilities are expected to be found in the future as the tool has been successfully integrated into Mimiker's workflow -- the kernel grows rapidly and each new code change is now required to pass all tests with KASan enabled.
+
+Further work here includes enhancing KASan's error reports so that they contain extra information about an invalidly accessed heap block: its size, stack trace of allocation and deallocation, and the like.
+It can be achieved by storing appropriate metadata inside redzones.
+Additionally, in order to find even more memory bugs, other sanitizers and a fuzzer can be added to the Mimiker kernel.
+
+\begin{thebibliography}{99}
+
+\bibitem{bib:double-free-ub}
+\texttt{MALLOC(3)}, Linux Programmer's Manual
+
+\bibitem{bib:strdup}
+\texttt{STRDUP(3)}, Linux Programmer's Manual
+
+\bibitem{bib:strcpy}
+\texttt{STRCPY(3)}, Linux Programmer's Manual
+
+\bibitem{bib:copy-bsd}
+\texttt{COPY(9)}, BSD Kernel Developer's Manual
+
+\bibitem{bib:netbsd-options-4}
+\texttt{OPTIONS(4)}, NetBSD Kernel Interfaces Manual
+
+\bibitem{bib:netbsd-kmem-9}
+\texttt{KMEM(9)}, NetBSD Kernel Developer's Manual
+
+\bibitem{bib:kubsan-openbsd}
+\texttt{KUBSAN(4)}, OpenBSD Device Drivers Manual
+
+\bibitem{bib:nullptr-ub}
+ISO/IEC 9899:2017 (C language) standard
+
+\bibitem{bib:secure-c-cpp}
+Robert C. Seacord,
+\textit{Secure Coding in C and C++},
+Pearson Education, 2013
+
+\bibitem{bib:linux-kernel-arch}
+Wolfgang Mauerer,
+\textit{Professional Linux Kernel Architecture},
+Wiley Publishing, 2008
+
+\bibitem{bib:csapp}
+R. Bryant, D. O'Hallaron,
+\textit{Computer Systems: A Programmer's Perspective},
+3rd edition,
+Pearson Education,
+2016
+
+\bibitem{bib:freebsd-book}
+M. McKusick, G. Neville-Neil, R. Watson,
+\textit{The Design and Implementation of the FreeBSD Operating System},
+2nd edition, Pearson Education, 2015
+
+\bibitem{bib:freebsd-drivers}
+Joseph Kong,
+\textit{FreeBSD Device Drivers: A Guide for the Intrepid},
+No Starch Press, 2012
+
+\bibitem{bib:stallings}
+William Stallings,
+\textit{Operating Systems: Internals and Design Principles},
+8th edition,
+Pearson Education, 2015
+
+\bibitem{bib:mips-architecture}
+MIPS Architecture For Programmers, Vol. III: MIPS32 / microMIPS32 Privileged Resource Architecture, 2015
+
+\bibitem{bib:undefined-behavior}
+C++ reference, Undefined behavior,
+\url{https://en.cppreference.com/w/c/language/behavior}
+
+\bibitem{bib:memcheck-sanitizers-1}
+Linux Kernel Mailing List archive,
+\textit{Re: [PATCH] mm: kill kmemcheck again},
+\url{https://lkml.org/lkml/2017/9/30/142}
+
+\bibitem{bib:memcheck-sanitizers-2}
+Linux Kernel Mailing List archive,
+\textit{[PATCH 4.14 079/167] kmemcheck: remove annotations},
+\url{https://lkml.org/lkml/2018/2/21/703}
+
+\bibitem{bib:kernel-org-memleak}
+The Linux Kernel documentation,
+Kernel Memory Leak Detector,
+\url{https://www.kernel.org/doc/html/v4.14/dev-tools/kmemleak.html}
+
+\bibitem{bib:sparse}
+The Linux Kernel documentation,
+Sparse,
+\url{https://www.kernel.org/doc/html/latest/dev-tools/sparse.html}
+
+\bibitem{bib:kcov}
+The Linux Kernel documentation,
+kcov,
+\url{https://www.kernel.org/doc/html/latest/dev-tools/kcov.html}
+
+\bibitem{bib:sparse-examples}
+Reports generated by Sparse (a static code analyser for the Linux kernel),
+\url{https://kernel.ubuntu.com/~kernel-ppa/static-analysis/daily/sparse}
+
+\bibitem{bib:lwn-kmemcheck}
+LWN (Linux Weekly News),
+kmemcheck,
+\url{https://lwn.net/Articles/260068}
+
+\bibitem{bib:lwn-khwasan}
+LWN (Linux Weekly News),
+khwasan: kernel hardware assisted address sanitizer,
+\url{https://lwn.net/Articles/763684}
+
+\bibitem{bib:lwn-kcsan}
+LWN (Linux Weekly News),
+Concurrency bugs should fear the big bad data-race detector,
+\url{https://lwn.net/Articles/816850}
+
+\bibitem{bib:lwn-kaslr}
+LWN (Linux Weekly News),
+Kernel address space layout randomization,
+\url{https://lwn.net/Articles/569635}
+
+\bibitem{bib:msan-paper}
+E. Stepanov, K. Serebryany,
+MemorySanitizer: fast detector of C uninitialized memory use in C++,
+\url{https://research.google/pubs/pub43308}
+
+\bibitem{bib:tsan-algorithm}
+K. Serebryany, T. Iskhodzhanov,
+ThreadSanitizer – data race detection in practice,
+\url{https://research.google/pubs/pub35604}
+
+\bibitem{bib:asan-paper}
+K. Serebryany et al.,
+AddressSanitizer: A Fast Address Sanity Checker,
+\url{https://www.usenix.org/system/files/conference/atc12/atc12-final39.pdf}
+
+\bibitem{bib:asan-found-bugs}
+google/sanitizers repository,
+Address Sanitizer Found Bugs,
+\url{https://github.com/google/sanitizers/wiki/AddressSanitizerFoundBugs}
+
+\bibitem{bib:linux-kasan-found}
+google/kasan repository,
+Found Bugs,
+\url{https://github.com/google/kasan/blob/master/FOUND_BUGS.md}
+
+\bibitem{bib:kmsan-github}
+google/kmsan repository,
+\url{https://github.com/google/kmsan}
+
+\bibitem{bib:google-ktsan}
+google/ktsan repository,
+\url{https://github.com/google/ktsan}
+
+\bibitem{bib:syzkaller}
+google/syzkaller repository,
+\url{https://github.com/google/syzkaller}
+
+\bibitem{bib:syzbot}
+syzbot,
+\url{https://syzkaller.appspot.com}
+
+\bibitem{bib:formal-verification-1}
+Yuji Kukimoto,
+Introduction to Formal Verification,
+\url{https://ptolemy.berkeley.edu/projects/embedded/research/vis/doc/VisUser/vis_user/node4.html}
+
+\bibitem{bib:formal-verification-2}
+John Franco,
+What is Formal Verification, Why is its Importance Increasing, and How is it Developing?
+\url{http://gauss.ececs.uc.edu/Courses/c626/lectures/Intro/std.pdf}
+
+\bibitem{bib:compcert}
+The CompCert project,
+\url{http://compcert.inria.fr}
+
+\bibitem{bib:seL4}
+G. Klein et al.,
+seL4: Formal Verification of an OS Kernel,
+\url{https://web1.cs.columbia.edu/~junfeng/09fa-e6998/papers/sel4.pdf}
+
+\bibitem{bib:gcc-4.8-changes}
+GCC 4.8 release notes,
+\url{https://gcc.gnu.org/gcc-4.8/changes.html}
+
+\bibitem{bib:gcc-10}
+GCC 10 release notes,
+\url{https://gcc.gnu.org/gcc-10/changes.html}
+
+\bibitem{bib:msrc-memory-issues}
+Microsoft Security Response Center,
+Trends, Challenges, and Strategic Shifts in the Software Vulnerability Mitigation Landscape, BlueHat IL 2019,
+\url{https://github.com/Microsoft/MSRC-Security-Research/tree/master/presentations/2019_02_BlueHatIL}
+
+\bibitem{bib:initall}
+Microsoft Security Response Center,
+Solving Uninitialized Stack Memory on Windows,
+\url{https://msrc-blog.microsoft.com/2020/05/13/solving-uninitialized-stack-memory-on-windows}
+
+\bibitem{bib:software-instrumentation}
+Software Instrumentation, Wiley Encyclopedia of Computer Science and Engineering,
+\url{https://onlinelibrary.wiley.com/doi/abs/10.1002/9780470050118.ecse386}
+
+\bibitem{bib:gcc-initialization}
+GNU Compiler Collection (GCC) Internals, How Initialization Functions Are Handled,
+\url{https://gcc.gnu.org/onlinedocs/gccint/Initialization.html#Initialization}
+
+\bibitem{bib:libstdc++-debug}
+The GNU C++ Library, Debug Mode,
+\url{https://gcc.gnu.org/onlinedocs/libstdc++/manual/debug_mode.html}
+
+\bibitem{bib:linker-script}
+GNU linker \texttt{ld}, Linker Scripts,
+\url{https://sourceware.org/binutils/docs/ld/Scripts.html}
+
+\bibitem{bib:stack-canaries}
+N. Heninger and D. Stefan,
+CSE 127: Computer Security, Low-level mitigations,
+\url{https://cseweb.ucsd.edu/classes/fa19/cse127-ab/slides/3-lowlevelmitigations.pdf}
+
+\bibitem{bib:valgrind}
+N. Nethercote and J. Seward,
+Valgrind: A Framework for Heavyweight Dynamic Binary Instrumentation,
+\url{https://dl.acm.org/doi/10.1145/1250734.1250746}
+
+\bibitem{bib:kleak-paper}
+T. Barabosch, M. Villard, KLEAK: Practical Kernel Memory Disclosure Detection,
+\url{https://www.netbsd.org/gallery/presentations/maxv/kleak.pdf}
+
+\bibitem{bib:fuzzing}
+B. Chen et al.,
+Fuzzing OpenSSL,
+\url{https://courses.csail.mit.edu/6.857/2019/project/11-Chen-Kim-Lam.pdf}
+
+\bibitem{bib:linux-user-macro}
+The Linux kernel 5.0 source code, search \texttt{\_\_user},
+\url{https://elixir.bootlin.com/linux/v5.0/A/ident/__user}
+
+\bibitem{bib:linux-releases-macro}
+The Linux kernel 5.0 source code, search \texttt{\_\_releases},
+\url{https://elixir.bootlin.com/linux/v5.0/A/ident/__releases}
+
+\bibitem{bib:linux-kasan-code}
+The Linux kernel 5.0 source code, file \texttt{mm/kasan/generic.c},
+\url{https://elixir.bootlin.com/linux/v5.0/source/mm/kasan/generic.c}
+
+\bibitem{bib:netbsd-kasan-code}
+The NetBSD kernel source code, file \texttt{sys/kern/subr\_asan.c},
+\url{https://nxr.netbsd.org/xref/src/sys/kern/subr_asan.c}
+
+\bibitem{bib:gcc-kasan-code}
+The GCC source code, directory \texttt{libsanitizer/asan},
+\url{https://github.com/gcc-mirror/gcc/tree/master/libsanitizer/asan}
+
+\bibitem{bib:linux-kasan}
+The Linux 4.0 release notes,
+\url{https://kernelnewbies.org/Linux_4.0}
+
+\bibitem{bib:netbsd-9-notes}
+NetBSD 9.0 release notes,
+\url{https://www.netbsd.org/releases/formal-9/NetBSD-9.0.html}
+
+\bibitem{bib:netbsd-kasan-slowdown}
+Kamil Rytarowski,
+Taking NetBSD kernel bug roast to the next level: Kernel Sanitizers,
+EuroBSDcon 2018,
+\url{https://www.netbsd.org/~kamil/eurobsdcon2018_ksanitizers.html#slide7}
+
+\bibitem{bib:freebsd-kasan}
+FreeBSD Wiki, SummerOfCode2019Projects, KernelSanitizers,
+\url{https://wiki.freebsd.org/SummerOfCode2019Projects/KernelSanitizers}
+
+\bibitem{bib:linux-loc}
+Linux in 2020: 27.8 million lines of code in the kernel,
+\url{https://www.linux.com/news/linux-in-2020-27-8-million-lines-of-code-in-the-kernel-1-3-million-in-systemd}
+
+\bibitem{bib:protostar-bib2}
+Exploit Education website, \textit{Heap Two} task,
+\url{https://exploit.education/protostar/heap-two}
+
+\bibitem{bib:gynvael-blog}
+Gynvael Coldwind's blog,
+\url{https://gynvael.coldwind.pl}
+
+\bibitem{bib:project-zero}
+Google Project Zero blog,
+\url{https://googleprojectzero.blogspot.com}
+
+\bibitem{bib:mazur}
+A brief introduction to Binary Exploitation,
+\url{http://mzr.re/posts/intro-to-binary-exploitation}
+
+\bibitem{bib:cahir}
+Krystian Bacławski's website,
+\url{http://cahirwpz.cs.uni.wroc.pl}
+
+\bibitem{bib:mimiker}
+The Mimiker Project,
+\url{https://mimiker.ii.uni.wroc.pl}
+
+\bibitem{bib:mimiker-github}
+The Mimiker's GitHub repository,
+\url{https://github.com/cahirwpz/mimiker}
+
+\bibitem{bib:mimiker-opengrok}
+The Mimiker's OpenGrok,
+\url{https://mimiker.ii.uni.wroc.pl/source/xref/mimiker}
+
+\bibitem{bib:mimiker-kasan-milestone}
+The Mimiker's ,,KASAN'' milestone,
+\url{https://github.com/cahirwpz/mimiker/milestone/4?closed=1}
+
+\bibitem{bib:github635}
+cahirwpz/mimiker repository issue \#635:
+\textit{strntoul's implementation shouldn't read more than n bytes},
+\url{https://github.com/cahirwpz/mimiker/issues/635}
+
+\bibitem{bib:github636}
+cahirwpz/mimiker repository pull request \#636:
+\textit{Access kernel stack using only KSEG2 addresses},
+\url{https://github.com/cahirwpz/mimiker/pull/636}
+
+\bibitem{bib:github645}
+cahirwpz/mimiker repository pull request \#645:
+\textit{Fix use-after-free inside thread\_reap},
+\url{https://github.com/cahirwpz/mimiker/pull/645}
+
+\bibitem{bib:github647}
+cahirwpz/mimiker repository pull request \#647:
+\textit{Fix stack-buffer-overflow in videomode\_write},
+\url{https://github.com/cahirwpz/mimiker/pull/647}
+
+\bibitem{bib:github653}
+cahirwpz/mimiker repository issue \#653:
+\textit{Use-after-free in tmpfs\_alloc\_dirent},
+\url{https://github.com/cahirwpz/mimiker/issues/653}
+
+\bibitem{bib:github678}
+cahirwpz/mimiker repository issue \#678:
+\textit{callout\_thread uses freed stack memory},
+\url{https://github.com/cahirwpz/mimiker/issues/678}
+
+\bibitem{bib:github685}
+cahirwpz/mimiker repository issue \#685:
+\textit{Use-after-free in device\_add\_resource},
+\url{https://github.com/cahirwpz/mimiker/issues/685}
+
+\bibitem{bib:github705}
+cahirwpz/mimiker repository pull request \#705:
+\textit{Fix race between kmem\_free() and kmem\_alloc()},
+\url{https://github.com/cahirwpz/mimiker/pull/705}
+
+\end{thebibliography}
+\end{document}
+
