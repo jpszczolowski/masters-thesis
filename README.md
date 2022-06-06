@@ -1,8 +1,16 @@
-# masters-thesis
+# Master's thesis
+
+## Author
+
+Julian Pszczołowski
 
 ## Title
 
 Integrating the Kernel Address Sanitizer into the Mimiker Operating System
+
+## Year
+
+2020
 
 ## Abstract
 
